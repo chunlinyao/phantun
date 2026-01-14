@@ -1,7 +1,8 @@
-use clap::{crate_version, Arg, ArgAction, Command};
-use fake_tcp::packet::MAX_PACKET_LEN;
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::Stack;
+use fake_tcp::packet::MAX_PACKET_LEN;
 use log::{debug, error, info};
+use phantun::fec::{FecConfig, FecDecoder, FecEncoder, parse_fec_spec};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
 use std::fs;
 use std::io;
@@ -9,11 +10,15 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
-use tokio::time;
+use tokio::time::{self, MissedTickBehavior};
 use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
 
 use phantun::UDP_TTL;
+
+const DEFAULT_FEC_FLUSH_MS_STR: &str = "5";
+const DEFAULT_FEC_TTL_MS_STR: &str = "200";
+const MAX_FEC_GROUPS: usize = 256;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -101,6 +106,29 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("fec")
+                .long("fec")
+                .required(false)
+                .value_name("K/N")
+                .help("Enable FEC with K data shards and N parity shards, e.g. 8/2")
+        )
+        .arg(
+            Arg::new("fec_flush_ms")
+                .long("fec-flush-ms")
+                .required(false)
+                .value_name("MS")
+                .help("FEC encoder flush interval in milliseconds")
+                .default_value(DEFAULT_FEC_FLUSH_MS_STR)
+        )
+        .arg(
+            Arg::new("fec_ttl_ms")
+                .long("fec-ttl-ms")
+                .required(false)
+                .value_name("MS")
+                .help("FEC decoder group TTL in milliseconds")
+                .default_value(DEFAULT_FEC_TTL_MS_STR)
+        )
         .get_matches();
 
     let local_port: u16 = matches
@@ -146,6 +174,17 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+    let fec_config = matches
+        .get_one::<String>("fec")
+        .and_then(|spec| parse_fec_spec(spec))
+        .map(|(data_shards, parity_shards)| FecConfig {
+            data_shards,
+            parity_shards,
+            flush_interval: time::Duration::from_millis(
+                *matches.get_one::<u64>("fec_flush_ms").unwrap(),
+            ),
+            group_ttl: time::Duration::from_millis(*matches.get_one::<u64>("fec_ttl_ms").unwrap()),
+        });
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -202,43 +241,117 @@ async fn main() -> io::Result<()> {
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
                 let udp_sock = new_udp_reuseport(local_addr);
+                let fec_config = fec_config.clone();
 
                 tokio::spawn(async move {
                     udp_sock.connect(remote_addr).await.unwrap();
+                    let mut encoder = fec_config
+                        .as_ref()
+                        .map(|cfg| FecEncoder::new(cfg.clone(), MAX_PACKET_LEN));
+                    let mut decoder = fec_config
+                        .as_ref()
+                        .map(|cfg| FecDecoder::new(cfg.group_ttl, MAX_FEC_GROUPS));
+                    let mut flush_interval = fec_config.as_ref().map(|cfg| {
+                        let mut interval = time::interval(cfg.flush_interval);
+                        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                        interval
+                    });
 
-                    loop {
-                        tokio::select! {
-                            Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                if sock.send(&buf_udp[..size]).await.is_none() {
-                                    quit.cancel();
-                                    return;
-                                }
+                    if let Some(ref mut flush_interval) = flush_interval {
+                        flush_interval.tick().await;
+                    }
 
-                                packet_received.notify_one();
-                            },
-                            res = sock.recv(&mut buf_tcp) => {
-                                match res {
-                                    Some(size) => {
-                                        if size > 0
-                                            && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                    if encoder.is_some() {
+                        loop {
+                            tokio::select! {
+                                Ok(size) = udp_sock.recv(&mut buf_udp) => {
+                                    if let Some(ref mut encoder) = encoder {
+                                        let frames = encoder.push(&buf_udp[..size]);
+                                        for frame in frames {
+                                            if sock.send(&frame).await.is_none() {
                                                 quit.cancel();
                                                 return;
                                             }
-                                    },
-                                    None => {
+                                        }
+                                    }
+                                    packet_received.notify_one();
+                                },
+                                res = sock.recv(&mut buf_tcp) => {
+                                    match res {
+                                        Some(size) => {
+                                            if size > 0 {
+                                                if let Some(ref mut decoder) = decoder {
+                                                    let packets = decoder.push(&buf_tcp[..size]);
+                                                    for packet in packets {
+                                                        if let Err(e) = udp_sock.send(&packet).await {
+                                                            error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                            quit.cancel();
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        None => {
+                                            quit.cancel();
+                                            return;
+                                        },
+                                    }
+
+                                    packet_received.notify_one();
+                                },
+                                _ = flush_interval.as_mut().unwrap().tick() => {
+                                    if let Some(ref mut encoder) = encoder {
+                                        let frames = encoder.flush();
+                                        for frame in frames {
+                                            if sock.send(&frame).await.is_none() {
+                                                quit.cancel();
+                                                return;
+                                            }
+                                        }
+                                    }
+                                },
+                                _ = quit.cancelled() => {
+                                    debug!("worker {} terminated", i);
+                                    return;
+                                },
+                            };
+                        }
+                    } else {
+                        loop {
+                            tokio::select! {
+                                Ok(size) = udp_sock.recv(&mut buf_udp) => {
+                                    if sock.send(&buf_udp[..size]).await.is_none() {
                                         quit.cancel();
                                         return;
-                                    },
-                                }
+                                    }
 
-                                packet_received.notify_one();
-                            },
-                            _ = quit.cancelled() => {
-                                debug!("worker {} terminated", i);
-                                return;
-                            },
-                        };
+                                    packet_received.notify_one();
+                                },
+                                res = sock.recv(&mut buf_tcp) => {
+                                    match res {
+                                        Some(size) => {
+                                            if size > 0
+                                                && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
+                                                    error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                    quit.cancel();
+                                                    return;
+                                                }
+                                        },
+                                        None => {
+                                            quit.cancel();
+                                            return;
+                                        },
+                                    }
+
+                                    packet_received.notify_one();
+                                },
+                                _ = quit.cancelled() => {
+                                    debug!("worker {} terminated", i);
+                                    return;
+                                },
+                            };
+                        }
                     }
                 });
             }
