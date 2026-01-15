@@ -1,0 +1,32 @@
+#
+# Cross-compile release artifacts for multiple CPU architectures
+#
+FROM rust:latest AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc-arm-linux-gnueabihf \
+    musl-tools \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add \
+    armv7-unknown-linux-gnueabihf \
+    x86_64-unknown-linux-musl
+
+WORKDIR /phantun
+COPY . .
+
+RUN cargo build --release --target armv7-unknown-linux-gnueabihf \
+  && cargo build --release --target x86_64-unknown-linux-musl \
+  && mkdir -p /out/armv7-unknown-linux-gnueabihf /out/x86_64-unknown-linux-musl \
+  && install -m 755 target/armv7-unknown-linux-gnueabihf/release/server /out/armv7-unknown-linux-gnueabihf/phantun-server \
+  && install -m 755 target/armv7-unknown-linux-gnueabihf/release/client /out/armv7-unknown-linux-gnueabihf/phantun-client \
+  && install -m 755 target/x86_64-unknown-linux-musl/release/server /out/x86_64-unknown-linux-musl/phantun-server \
+  && install -m 755 target/x86_64-unknown-linux-musl/release/client /out/x86_64-unknown-linux-musl/phantun-client \
+  && tar -C /out -czf /out/phantun_armv7-unknown-linux-gnueabihf.tar.gz armv7-unknown-linux-gnueabihf \
+  && tar -C /out -czf /out/phantun_x64_musl.tar.gz x86_64-unknown-linux-musl
+
+FROM scratch AS export
+
+COPY --from=builder /out/phantun_armv7-unknown-linux-gnueabihf.tar.gz /
+COPY --from=builder /out/phantun_x64_musl.tar.gz /
