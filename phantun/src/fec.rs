@@ -170,30 +170,40 @@ impl FecDecoder {
         let now = Instant::now();
         self.prune(now);
 
-        let entry = self.groups.entry(parsed.group_id).or_insert_with(|| {
-            GroupState::new(
-                parsed.data_shards,
-                parsed.parity_shards,
-                parsed.lengths.clone(),
-                parsed.payload.len(),
-                now,
-            )
-        });
+        let mut output = Vec::new();
+        let ready = {
+            let entry = self.groups.entry(parsed.group_id).or_insert_with(|| {
+                GroupState::new(
+                    parsed.data_shards,
+                    parsed.parity_shards,
+                    parsed.lengths.clone(),
+                    parsed.payload.len(),
+                    now,
+                )
+            });
 
-        if parsed.payload.len() > entry.shard_size {
-            entry.resize_shards(parsed.payload.len());
-        }
+            if parsed.payload.len() > entry.shard_size {
+                entry.resize_shards(parsed.payload.len());
+            }
 
-        entry.last_seen = now;
-        entry.insert_shard(parsed.shard_index as usize, parsed.payload);
+            entry.last_seen = now;
+            entry.insert_shard(parsed.shard_index as usize, parsed.payload);
 
-        if entry.ready_to_reconstruct() {
-            let recovered = entry.reconstruct();
+            // Systematic behavior: deliver any available data shards immediately (in shard index order).
+            output.extend(entry.deliver_ready());
+
+            let ready = entry.ready_to_reconstruct();
+            if ready {
+                entry.reconstruct();
+                output.extend(entry.deliver_ready());
+            }
+            ready
+        };
+        if ready {
             self.groups.remove(&parsed.group_id);
-            return recovered;
         }
 
-        Vec::new()
+        output
     }
 
     fn prune(&mut self, now: Instant) {
@@ -219,6 +229,7 @@ struct GroupState {
     parity_shards: usize,
     lengths: Vec<u16>,
     shards: Vec<Option<Vec<u8>>>,
+    delivered: Vec<bool>,
     shard_size: usize,
     last_seen: Instant,
 }
@@ -237,6 +248,7 @@ impl GroupState {
             parity_shards: parity_shards as usize,
             lengths,
             shards: vec![None; total],
+            delivered: vec![false; total],
             shard_size,
             last_seen: now,
         }
@@ -267,22 +279,35 @@ impl GroupState {
         present >= self.data_shards
     }
 
-    fn reconstruct(&mut self) -> Vec<Vec<u8>> {
+    fn reconstruct(&mut self) {
         let rs = ReedSolomon::new(self.data_shards, self.parity_shards)
             .expect("invalid shard sizes for reconstruction");
         if let Err(err) = rs.reconstruct(&mut self.shards) {
             debug!("FEC reconstruct failed: {}", err);
-            return Vec::new();
         }
+    }
 
+    fn deliver_ready(&mut self) -> Vec<Vec<u8>> {
         let mut output = Vec::new();
         for i in 0..self.data_shards {
-            let len = *self.lengths.get(i).unwrap_or(&0) as usize;
-            if len == 0 {
+            if self.delivered.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            if let Some(ref shard) = self.shards[i] {
-                output.push(shard[..len.min(shard.len())].to_vec());
+            let len = *self.lengths.get(i).unwrap_or(&0) as usize;
+            if len == 0 {
+                // Empty payload shard (padding) — mark delivered to avoid blocking later shards.
+                self.delivered[i] = true;
+                continue;
+            }
+            match self.shards.get(i).and_then(|s| s.as_ref()) {
+                Some(shard) => {
+                    output.push(shard[..len.min(shard.len())].to_vec());
+                    self.delivered[i] = true;
+                }
+                None => {
+                    // Allow out-of-order delivery: skip missing shard; it can be delivered later when available.
+                    continue;
+                }
             }
         }
         output
@@ -412,7 +437,68 @@ mod tests {
             recovered.extend(decoder.push(&frame));
         }
 
-        assert_eq!(recovered, payloads);
+        let mut recovered_sorted = recovered.clone();
+        recovered_sorted.sort();
+        let mut expected_sorted = payloads.clone();
+        expected_sorted.sort();
+        assert_eq!(recovered_sorted, expected_sorted);
+    }
+
+    #[test]
+    fn fec_immediate_delivery_single_shard() {
+        let config = FecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            flush_interval: Duration::from_millis(5),
+            group_ttl: Duration::from_millis(200),
+        };
+        let mut encoder = FecEncoder::new(config.clone(), 1500);
+        let payload = b"hello".to_vec();
+
+        encoder.push(&payload);
+        let frames = encoder.flush();
+        assert_eq!(frames.len(), config.data_shards + config.parity_shards);
+
+        let mut decoder = FecDecoder::new(config.group_ttl, 8);
+        // First frame should be data shard 0 and delivered immediately.
+        let out = decoder.push(&frames[0]);
+        assert_eq!(out, vec![payload]);
+    }
+
+    #[test]
+    fn fec_delivery_out_of_order_when_gap_present() {
+        let config = FecConfig {
+            data_shards: 4,
+            parity_shards: 2,
+            flush_interval: Duration::from_millis(5),
+            group_ttl: Duration::from_millis(200),
+        };
+        let mut encoder = FecEncoder::new(config.clone(), 1500);
+        let payloads = vec![
+            b"alpha".to_vec(),
+            b"bravo".to_vec(),
+            b"charlie".to_vec(),
+            b"delta".to_vec(),
+        ];
+        let mut frames = Vec::new();
+        for p in &payloads {
+            frames.extend(encoder.push(p));
+        }
+        frames.extend(encoder.flush());
+        assert!(!frames.is_empty());
+        // Drop shard 0 to create a gap, but keep others (including parity).
+        frames.remove(0);
+
+        let mut decoder = FecDecoder::new(config.group_ttl, 8);
+        let mut out = Vec::new();
+        for f in &frames {
+            out.extend(decoder.push(f));
+            if !out.is_empty() {
+                break;
+            }
+        }
+        // Should deliver shard 1 even though shard 0 is missing.
+        assert_eq!(out, vec![payloads[1].clone()]);
     }
 
     #[test]
