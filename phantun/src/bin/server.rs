@@ -1,4 +1,4 @@
-use clap::{Arg, ArgAction, Command, crate_version};
+use clap::{Arg, ArgAction, Command, crate_version, value_parser};
 use fake_tcp::Stack;
 use fake_tcp::packet::MAX_PACKET_LEN;
 use log::{debug, error, info};
@@ -118,6 +118,7 @@ async fn main() -> io::Result<()> {
                 .long("fec-flush-ms")
                 .required(false)
                 .value_name("MS")
+                .value_parser(value_parser!(u64))
                 .help("FEC encoder flush interval in milliseconds")
                 .default_value(DEFAULT_FEC_FLUSH_MS_STR)
         )
@@ -126,6 +127,7 @@ async fn main() -> io::Result<()> {
                 .long("fec-ttl-ms")
                 .required(false)
                 .value_name("MS")
+                .value_parser(value_parser!(u64))
                 .help("FEC decoder group TTL in milliseconds")
                 .default_value(DEFAULT_FEC_TTL_MS_STR)
         )
@@ -196,7 +198,13 @@ async fn main() -> io::Result<()> {
         .destination(tun_peer)
         .queues(num_cpus)
         .build()
-        .unwrap();
+        .unwrap_or_else(|e| {
+            error!(
+                "Failed to create TUN device {}: {}. Hint: run as root/CAP_NET_ADMIN and ensure /dev/net/tun exists.",
+                tun_name, e
+            );
+            panic!("failed to create TUN device");
+        });
 
     if let (Some(tun_local6), Some(tun_peer6)) = (tun_local6, tun_peer6) {
         assign_ipv6_address(tun[0].name(), tun_local6, tun_peer6);
