@@ -1,15 +1,18 @@
 use clap::{Arg, ArgAction, Command, crate_version, value_parser};
-use fake_tcp::Stack;
+use fake_tcp::{Socket, Stack};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use log::{debug, error, info};
 use phantun::fec::{FecConfig, FecDecoder, FecEncoder, parse_fec_spec};
+use phantun::proto::{parse_control_frame, ControlType};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 use tokio::time::{self, MissedTickBehavior};
 use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
@@ -18,7 +21,26 @@ use phantun::UDP_TTL;
 
 const DEFAULT_FEC_FLUSH_MS_STR: &str = "5";
 const DEFAULT_FEC_TTL_MS_STR: &str = "200";
+const DEFAULT_SERVER_ROTATE_GRACE_MS_STR: &str = "200";
 const MAX_FEC_GROUPS: usize = 256;
+const CONTROL_READ_TIMEOUT_MS: u64 = 5000;
+
+struct ServerConnection {
+    socket: Arc<fake_tcp::Socket>,
+    packet_received: Arc<Notify>,
+    quit: CancellationToken,
+    session_id: u64,
+}
+
+struct SessionState {
+    udp_local_addr: std::net::SocketAddr,
+    active: Arc<ServerConnection>,
+}
+
+fn next_session_id() -> u64 {
+    static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+    SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -131,6 +153,15 @@ async fn main() -> io::Result<()> {
                 .help("FEC decoder group TTL in milliseconds")
                 .default_value(DEFAULT_FEC_TTL_MS_STR)
         )
+        .arg(
+            Arg::new("rotate_grace_ms")
+                .long("rotate-grace-ms")
+                .required(false)
+                .value_name("MS")
+                .value_parser(value_parser!(u64))
+                .help("Grace period before closing old connection after session resume")
+                .default_value(DEFAULT_SERVER_ROTATE_GRACE_MS_STR)
+        )
         .get_matches();
 
     let local_port: u16 = matches
@@ -176,6 +207,7 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+    let fec_ttl = time::Duration::from_millis(*matches.get_one::<u64>("fec_ttl_ms").unwrap());
     let fec_config = matches
         .get_one::<String>("fec")
         .and_then(|spec| parse_fec_spec(spec))
@@ -185,8 +217,10 @@ async fn main() -> io::Result<()> {
             flush_interval: time::Duration::from_millis(
                 *matches.get_one::<u64>("fec_flush_ms").unwrap(),
             ),
-            group_ttl: time::Duration::from_millis(*matches.get_one::<u64>("fec_ttl_ms").unwrap()),
+            group_ttl: fec_ttl,
         });
+    let rotate_grace =
+        time::Duration::from_millis(*matches.get_one::<u64>("rotate_grace_ms").unwrap());
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -217,9 +251,10 @@ async fn main() -> io::Result<()> {
     stack.listen(local_port);
     info!("Listening on {}", local_port);
 
+    let sessions: Arc<RwLock<HashMap<u64, Arc<SessionState>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
     let main_loop = tokio::spawn(async move {
-        let mut buf_udp = [0u8; MAX_PACKET_LEN];
-        let mut buf_tcp = [0u8; MAX_PACKET_LEN];
 
         loop {
             let sock = Arc::new(stack.accept().await);
@@ -232,156 +267,306 @@ async fn main() -> io::Result<()> {
 
                 debug!("Sent handshake packet to: {}", sock);
             }
+            let mut control_buf = [0u8; MAX_PACKET_LEN];
+            let Some((control_kind, session_id, first_payload)) =
+                read_initial_control(&sock, &mut control_buf).await
+            else {
+                continue;
+            };
+
+            let existing = sessions.read().await.get(&session_id).cloned();
+            let udp_local_addr = if let Some(ref state) = existing {
+                state.udp_local_addr
+            } else {
+                match allocate_udp_local_addr(remote_addr).await {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        error!("Unable to allocate UDP local address: {}", e);
+                        continue;
+                    }
+                }
+            };
 
             let packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
-            let udp_sock = UdpSocket::bind(if remote_addr.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            })
-            .await?;
-            let local_addr = udp_sock.local_addr()?;
-            drop(udp_sock);
-
-            for i in 0..num_cpus {
-                let sock = sock.clone();
-                let quit = quit.clone();
-                let packet_received = packet_received.clone();
-                let udp_sock = new_udp_reuseport(local_addr);
-                let fec_config = fec_config.clone();
-
-                tokio::spawn(async move {
-                    udp_sock.connect(remote_addr).await.unwrap();
-                    let mut encoder = fec_config
-                        .as_ref()
-                        .map(|cfg| FecEncoder::new(cfg.clone(), MAX_PACKET_LEN));
-                    let mut decoder = fec_config
-                        .as_ref()
-                        .map(|cfg| FecDecoder::new(cfg.group_ttl, MAX_FEC_GROUPS));
-                    let mut flush_interval = fec_config.as_ref().map(|cfg| {
-                        let mut interval = time::interval(cfg.flush_interval);
-                        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                        interval
-                    });
-
-                    if let Some(ref mut flush_interval) = flush_interval {
-                        flush_interval.tick().await;
-                    }
-
-                    if encoder.is_some() {
-                        loop {
-                            tokio::select! {
-                                Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                    if let Some(ref mut encoder) = encoder {
-                                        let frames = encoder.push(&buf_udp[..size]);
-                                        for frame in frames {
-                                            if sock.send(&frame).await.is_none() {
-                                                quit.cancel();
-                                                return;
-                                            }
-                                        }
-                                    }
-                                    packet_received.notify_one();
-                                },
-                                res = sock.recv(&mut buf_tcp) => {
-                                    match res {
-                                        Some(size) => {
-                                            if size > 0 {
-                                                if let Some(ref mut decoder) = decoder {
-                                                    let packets = decoder.push(&buf_tcp[..size]);
-                                                    for packet in packets {
-                                                        if let Err(e) = udp_sock.send(&packet).await {
-                                                            error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
-                                                            quit.cancel();
-                                                            return;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        },
-                                        None => {
-                                            quit.cancel();
-                                            return;
-                                        },
-                                    }
-
-                                    packet_received.notify_one();
-                                },
-                                _ = flush_interval.as_mut().unwrap().tick() => {
-                                    if let Some(ref mut encoder) = encoder {
-                                        let frames = encoder.flush();
-                                        for frame in frames {
-                                            if sock.send(&frame).await.is_none() {
-                                                quit.cancel();
-                                                return;
-                                            }
-                                        }
-                                    }
-                                },
-                                _ = quit.cancelled() => {
-                                    debug!("worker {} terminated", i);
-                                    return;
-                                },
-                            };
-                        }
-                    } else {
-                        loop {
-                            tokio::select! {
-                                Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                    if sock.send(&buf_udp[..size]).await.is_none() {
-                                        quit.cancel();
-                                        return;
-                                    }
-
-                                    packet_received.notify_one();
-                                },
-                                res = sock.recv(&mut buf_tcp) => {
-                                    match res {
-                                        Some(size) => {
-                                            if size > 0
-                                                && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
-                                                    error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
-                                                    quit.cancel();
-                                                    return;
-                                                }
-                                        },
-                                        None => {
-                                            quit.cancel();
-                                            return;
-                                        },
-                                    }
-
-                                    packet_received.notify_one();
-                                },
-                                _ = quit.cancelled() => {
-                                    debug!("worker {} terminated", i);
-                                    return;
-                                },
-                            };
-                        }
-                    }
-                });
-            }
-
-            tokio::spawn(async move {
-                loop {
-                    let read_timeout = time::sleep(UDP_TTL);
-                    let packet_received_fut = packet_received.notified();
-
-                    tokio::select! {
-                        _ = read_timeout => {
-                            info!("No traffic seen in the last {:?}, closing connection", UDP_TTL);
-
-                            quit.cancel();
-                            return;
-                        },
-                        _ = packet_received_fut => {},
-                    }
-                }
+            let entry = Arc::new(ServerConnection {
+                socket: sock.clone(),
+                packet_received: packet_received.clone(),
+                quit: quit.clone(),
+                session_id,
             });
+
+            spawn_workers(
+                entry.clone(),
+                udp_local_addr,
+                remote_addr,
+                num_cpus,
+                first_payload,
+                fec_config.clone(),
+                fec_ttl,
+            );
+
+            spawn_idle_timeout(
+                entry.clone(),
+                sessions.clone(),
+                session_id,
+                quit.clone(),
+            );
+
+            let state = Arc::new(SessionState {
+                udp_local_addr,
+                active: entry.clone(),
+            });
+            sessions.write().await.insert(session_id, state);
+
+            if let Some(old) = existing {
+                info!(
+                    "Session {} resumed ({:?}), scheduling old connection close",
+                    session_id, control_kind
+                );
+                let old_quit = old.active.quit.clone();
+                tokio::spawn(async move {
+                    time::sleep(rotate_grace).await;
+                    old_quit.cancel();
+                });
+            } else {
+                info!("Session {} started ({:?})", session_id, control_kind);
+            }
         }
     });
 
     tokio::join!(main_loop).0.unwrap()
+}
+
+async fn read_initial_control(
+    sock: &Socket,
+    buf: &mut [u8],
+) -> Option<(ControlType, u64, Option<Vec<u8>>)> {
+    let size = match time::timeout(
+        time::Duration::from_millis(CONTROL_READ_TIMEOUT_MS),
+        sock.recv(buf),
+    )
+    .await
+    {
+        Ok(Some(size)) => size,
+        Ok(None) => {
+            info!("Connection closed before control frame");
+            return None;
+        }
+        Err(_) => {
+            error!("Timed out waiting for control frame");
+            return None;
+        }
+    };
+
+    if let Some((kind, session_id)) = parse_control_frame(&buf[..size]) {
+        return Some((kind, session_id, None));
+    }
+
+    debug!("No control frame detected, falling back to legacy session");
+    Some((ControlType::Init, next_session_id(), Some(buf[..size].to_vec())))
+}
+
+async fn allocate_udp_local_addr(remote_addr: std::net::SocketAddr) -> io::Result<std::net::SocketAddr> {
+    let udp_sock = UdpSocket::bind(if remote_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .await?;
+    let local_addr = udp_sock.local_addr()?;
+    drop(udp_sock);
+    Ok(local_addr)
+}
+
+fn spawn_workers(
+    entry: Arc<ServerConnection>,
+    udp_local_addr: std::net::SocketAddr,
+    remote_addr: std::net::SocketAddr,
+    num_cpus: usize,
+    first_payload: Option<Vec<u8>>,
+    fec_config: Option<FecConfig>,
+    fec_ttl: time::Duration,
+) {
+    for i in 0..num_cpus {
+        let entry = entry.clone();
+        let sock = entry.socket.clone();
+        let quit = entry.quit.clone();
+        let packet_received = entry.packet_received.clone();
+        let udp_sock = new_udp_reuseport(udp_local_addr);
+        let fec_config = fec_config.clone();
+        let fec_ttl = fec_ttl;
+        let initial_payload = if i == 0 { first_payload.clone() } else { None };
+
+        tokio::spawn(async move {
+            let mut buf_udp = [0u8; MAX_PACKET_LEN];
+            let mut buf_tcp = [0u8; MAX_PACKET_LEN];
+            udp_sock.connect(remote_addr).await.unwrap();
+            let mut encoder = fec_config
+                .as_ref()
+                .map(|cfg| FecEncoder::new(cfg.clone(), MAX_PACKET_LEN));
+            let mut decoder = FecDecoder::new(fec_ttl, MAX_FEC_GROUPS);
+            let mut flush_interval = fec_config.as_ref().map(|cfg| {
+                let mut interval = time::interval(cfg.flush_interval);
+                interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                interval
+            });
+
+            if let Some(payload) = initial_payload {
+                let packets = decoder.push(&payload);
+                for packet in packets {
+                    if let Err(e) = udp_sock.send(&packet).await {
+                        error!(
+                            "Unable to send UDP packet to {}: {}, closing connection",
+                            e, remote_addr
+                        );
+                        quit.cancel();
+                        return;
+                    }
+                }
+                packet_received.notify_one();
+            }
+
+            if let Some(ref mut flush_interval) = flush_interval {
+                flush_interval.tick().await;
+            }
+
+            if encoder.is_some() {
+                loop {
+                    tokio::select! {
+                        Ok(size) = udp_sock.recv(&mut buf_udp) => {
+                            if let Some(ref mut encoder) = encoder {
+                                let frames = encoder.push(&buf_udp[..size]);
+                                for frame in frames {
+                                    if sock.send(&frame).await.is_none() {
+                                        quit.cancel();
+                                        return;
+                                    }
+                                }
+                            }
+                            packet_received.notify_one();
+                        },
+                        res = sock.recv(&mut buf_tcp) => {
+                            match res {
+                                Some(size) => {
+                                    if size > 0 {
+                                        let packets = decoder.push(&buf_tcp[..size]);
+                                        for packet in packets {
+                                            if let Err(e) = udp_sock.send(&packet).await {
+                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                quit.cancel();
+                                                return;
+                                            }
+                                        }
+                                    }
+                                },
+                                None => {
+                                    quit.cancel();
+                                    return;
+                                },
+                            }
+
+                            packet_received.notify_one();
+                        },
+                        _ = flush_interval.as_mut().unwrap().tick() => {
+                            if let Some(ref mut encoder) = encoder {
+                                let frames = encoder.flush();
+                                for frame in frames {
+                                    if sock.send(&frame).await.is_none() {
+                                        quit.cancel();
+                                        return;
+                                    }
+                                }
+                            }
+                        },
+                        _ = quit.cancelled() => {
+                            debug!("worker {} terminated (session {})", i, entry.session_id);
+                            return;
+                        },
+                    };
+                }
+            } else {
+                loop {
+                    tokio::select! {
+                        Ok(size) = udp_sock.recv(&mut buf_udp) => {
+                            if sock.send(&buf_udp[..size]).await.is_none() {
+                                quit.cancel();
+                                return;
+                            }
+
+                            packet_received.notify_one();
+                        },
+                        res = sock.recv(&mut buf_tcp) => {
+                            match res {
+                                Some(size) => {
+                                    if size > 0 {
+                                        let packets = decoder.push(&buf_tcp[..size]);
+                                        for packet in packets {
+                                            if let Err(e) = udp_sock.send(&packet).await {
+                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                quit.cancel();
+                                                return;
+                                            }
+                                        }
+                                    }
+                                },
+                                None => {
+                                    quit.cancel();
+                                    return;
+                                },
+                            }
+
+                            packet_received.notify_one();
+                        },
+                        _ = quit.cancelled() => {
+                            debug!("worker {} terminated (session {})", i, entry.session_id);
+                            return;
+                        },
+                    };
+                }
+            }
+        });
+    }
+}
+
+fn spawn_idle_timeout(
+    entry: Arc<ServerConnection>,
+    sessions: Arc<RwLock<HashMap<u64, Arc<SessionState>>>>,
+    session_id: u64,
+    quit: CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            let read_timeout = time::sleep(UDP_TTL);
+            let packet_received_fut = entry.packet_received.notified();
+
+            tokio::select! {
+                _ = read_timeout => {
+                    info!("No traffic seen in the last {:?}, closing connection", UDP_TTL);
+                    remove_if_current(&sessions, session_id, &entry).await;
+                    quit.cancel();
+                    return;
+                },
+                _ = quit.cancelled() => {
+                    remove_if_current(&sessions, session_id, &entry).await;
+                    return;
+                },
+                _ = packet_received_fut => {},
+            }
+        }
+    });
+}
+
+async fn remove_if_current(
+    sessions: &Arc<RwLock<HashMap<u64, Arc<SessionState>>>>,
+    session_id: u64,
+    entry: &Arc<ServerConnection>,
+) {
+    let mut map = sessions.write().await;
+    let Some(state) = map.get(&session_id) else {
+        return;
+    };
+    if Arc::ptr_eq(&state.active, entry) {
+        map.remove(&session_id);
+    }
 }

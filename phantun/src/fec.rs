@@ -1,6 +1,6 @@
 use log::{debug, warn};
 use reed_solomon_erasure::galois_8::ReedSolomon;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const FEC_MAGIC: u32 = 0x46454331; // "FEC1"
@@ -152,6 +152,8 @@ pub struct FecDecoder {
     ttl: Duration,
     max_groups: usize,
     groups: HashMap<u64, GroupState>,
+    completed: HashMap<u64, Instant>,
+    completed_order: VecDeque<u64>,
 }
 
 impl FecDecoder {
@@ -160,6 +162,8 @@ impl FecDecoder {
             ttl,
             max_groups,
             groups: HashMap::new(),
+            completed: HashMap::new(),
+            completed_order: VecDeque::new(),
         }
     }
 
@@ -169,6 +173,9 @@ impl FecDecoder {
         };
         let now = Instant::now();
         self.prune(now);
+        if self.completed.contains_key(&parsed.group_id) {
+            return Vec::new();
+        }
 
         let mut output = Vec::new();
         let ready = {
@@ -201,6 +208,8 @@ impl FecDecoder {
         };
         if ready {
             self.groups.remove(&parsed.group_id);
+            self.completed.insert(parsed.group_id, now);
+            self.completed_order.push_back(parsed.group_id);
         }
 
         output
@@ -219,6 +228,26 @@ impl FecDecoder {
             oldest.sort_by_key(|(_, ts)| *ts);
             for (id, _) in oldest.into_iter().take(self.groups.len() - self.max_groups) {
                 self.groups.remove(&id);
+            }
+        }
+
+        let completed_ttl = self.ttl.saturating_mul(2);
+        self.completed
+            .retain(|_, ts| now.duration_since(*ts) <= completed_ttl);
+        if !self.completed_order.is_empty() {
+            let mut filtered = VecDeque::with_capacity(self.completed_order.len());
+            for id in self.completed_order.drain(..) {
+                if self.completed.contains_key(&id) {
+                    filtered.push_back(id);
+                }
+            }
+            self.completed_order = filtered;
+        }
+        while self.completed.len() > self.max_groups {
+            if let Some(id) = self.completed_order.pop_front() {
+                self.completed.remove(&id);
+            } else {
+                break;
             }
         }
     }
@@ -362,7 +391,16 @@ fn decode_frame(frame: &[u8]) -> Option<ParsedFrame> {
     let shard_index = frame[7];
     let group_id = u64::from_be_bytes(frame[8..16].try_into().ok()?);
     let lengths_count = frame[16] as usize;
-    if data_shards == 0 || parity_shards == 0 || lengths_count != data_shards as usize {
+    let data_shards_usize = data_shards as usize;
+    let parity_shards_usize = parity_shards as usize;
+    let total_shards = data_shards_usize + parity_shards_usize;
+    if data_shards == 0
+        || parity_shards == 0
+        || data_shards_usize > MAX_DATA_SHARDS
+        || parity_shards_usize > MAX_DATA_SHARDS
+        || shard_index as usize >= total_shards
+        || lengths_count != data_shards_usize
+    {
         return None;
     }
     let lengths_bytes = lengths_count.checked_mul(2)?;
@@ -507,5 +545,32 @@ mod tests {
         let mut decoder = FecDecoder::new(Duration::from_millis(50), 8);
         let recovered = decoder.push(&payload);
         assert_eq!(recovered, vec![payload]);
+    }
+
+    #[test]
+    fn completed_group_dedup_suppresses_duplicates() {
+        let config = FecConfig {
+            data_shards: 2,
+            parity_shards: 1,
+            flush_interval: Duration::from_millis(5),
+            group_ttl: Duration::from_millis(200),
+        };
+        let mut encoder = FecEncoder::new(config.clone(), 1500);
+        let payloads = vec![b"alpha".to_vec(), b"bravo".to_vec()];
+        let mut frames = Vec::new();
+        for payload in &payloads {
+            frames.extend(encoder.push(payload));
+        }
+        assert_eq!(frames.len(), config.data_shards + config.parity_shards);
+
+        let mut decoder = FecDecoder::new(config.group_ttl, 8);
+        let mut recovered = Vec::new();
+        for frame in &frames {
+            recovered.extend(decoder.push(frame));
+        }
+        assert_eq!(recovered, payloads);
+
+        let dup = decoder.push(&frames[0]);
+        assert!(dup.is_empty());
     }
 }

@@ -3,12 +3,16 @@ use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
 use phantun::fec::{FecConfig, FecDecoder, FecEncoder, parse_fec_spec};
+use phantun::proto::{build_control_frame, ControlType};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::time::{self, MissedTickBehavior};
 use tokio_tun::TunBuilder;
@@ -26,6 +30,26 @@ struct ConnectionEntry {
     udp_local_addr: IpAddr,
     packet_received: Arc<Notify>,
     quit: CancellationToken,
+    session_id: u64,
+}
+
+fn session_nonce() -> u64 {
+    static NONCE: OnceLock<u64> = OnceLock::new();
+    *NONCE.get_or_init(|| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let pid = std::process::id() as u64;
+        now.as_nanos() as u64 ^ pid.rotate_left(17)
+    })
+}
+
+fn compute_session_id(udp_remote_addr: SocketAddr, udp_local_addr: IpAddr) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    session_nonce().hash(&mut hasher);
+    udp_remote_addr.hash(&mut hasher);
+    udp_local_addr.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[tokio::main]
@@ -201,6 +225,7 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+    let fec_ttl = time::Duration::from_millis(*matches.get_one::<u64>("fec_ttl_ms").unwrap());
     let fec_config = matches
         .get_one::<String>("fec")
         .and_then(|spec| parse_fec_spec(spec))
@@ -210,7 +235,7 @@ async fn main() -> io::Result<()> {
             flush_interval: time::Duration::from_millis(
                 *matches.get_one::<u64>("fec_flush_ms").unwrap(),
             ),
-            group_ttl: time::Duration::from_millis(*matches.get_one::<u64>("fec_ttl_ms").unwrap()),
+            group_ttl: fec_ttl,
         });
     let rotate_interval = matches
         .get_one::<String>("rotate_interval")
@@ -270,6 +295,7 @@ async fn main() -> io::Result<()> {
                         num_cpus,
                         handshake_packet.as_ref(),
                         fec_config.clone(),
+                        fec_ttl,
                         rotate_interval,
                         rotate_tx.clone(),
                     )
@@ -285,6 +311,7 @@ async fn main() -> io::Result<()> {
                         num_cpus,
                         handshake_packet.as_ref(),
                         fec_config.clone(),
+                        fec_ttl,
                         rotate_interval,
                         rotate_grace,
                         rotate_tx.clone(),
@@ -309,6 +336,7 @@ async fn handle_udp_packet(
     num_cpus: usize,
     handshake_packet: Option<&Vec<u8>>,
     fec_config: Option<FecConfig>,
+    fec_ttl: time::Duration,
     rotate_interval: Option<time::Duration>,
     rotate_tx: mpsc::UnboundedSender<SocketAddr>,
 ) {
@@ -322,9 +350,12 @@ async fn handle_udp_packet(
     }
 
     info!("New UDP client from {}", udp_remote_addr);
+    let session_id = compute_session_id(udp_remote_addr, udp_local_addr);
     let Some(entry) = build_connection(
         udp_remote_addr,
         udp_local_addr,
+        session_id,
+        ControlType::Init,
         Some(payload.to_vec()),
         connections,
         stack,
@@ -333,6 +364,7 @@ async fn handle_udp_packet(
         num_cpus,
         handshake_packet,
         fec_config,
+        fec_ttl,
         rotate_interval,
         rotate_tx,
     )
@@ -353,6 +385,7 @@ async fn handle_rotate_request(
     num_cpus: usize,
     handshake_packet: Option<&Vec<u8>>,
     fec_config: Option<FecConfig>,
+    fec_ttl: time::Duration,
     rotate_interval: Option<time::Duration>,
     rotate_grace: time::Duration,
     rotate_tx: mpsc::UnboundedSender<SocketAddr>,
@@ -362,10 +395,15 @@ async fn handle_rotate_request(
         return;
     };
 
-    info!("Rotating fake TCP connection for {}", udp_remote_addr);
+    info!(
+        "Rotating fake TCP connection for {} (session {})",
+        udp_remote_addr, current.session_id
+    );
     let Some(entry) = build_connection(
         udp_remote_addr,
         current.udp_local_addr,
+        current.session_id,
+        ControlType::Resume,
         None,
         connections,
         stack,
@@ -374,6 +412,7 @@ async fn handle_rotate_request(
         num_cpus,
         handshake_packet,
         fec_config,
+        fec_ttl,
         rotate_interval,
         rotate_tx,
     )
@@ -394,6 +433,8 @@ async fn handle_rotate_request(
 async fn build_connection(
     udp_remote_addr: SocketAddr,
     udp_local_addr: IpAddr,
+    session_id: u64,
+    control_kind: ControlType,
     first_payload: Option<Vec<u8>>,
     connections: &Arc<RwLock<HashMap<SocketAddr, Arc<ConnectionEntry>>>>,
     stack: &mut Stack,
@@ -402,11 +443,18 @@ async fn build_connection(
     num_cpus: usize,
     handshake_packet: Option<&Vec<u8>>,
     fec_config: Option<FecConfig>,
+    fec_ttl: time::Duration,
     rotate_interval: Option<time::Duration>,
     rotate_tx: mpsc::UnboundedSender<SocketAddr>,
 ) -> Option<Arc<ConnectionEntry>> {
     let sock = stack.connect(remote_addr).await?;
     let sock = Arc::new(sock);
+    let control_frame = build_control_frame(control_kind, session_id);
+    if sock.send(&control_frame).await.is_none() {
+        error!("Failed to send control frame to remote, closing connection.");
+        return None;
+    }
+
     if let Some(p) = handshake_packet {
         if sock.send(p).await.is_none() {
             error!("Failed to send handshake packet to remote, closing connection.");
@@ -423,6 +471,7 @@ async fn build_connection(
         udp_local_addr,
         packet_received: packet_received.clone(),
         quit: quit.clone(),
+        session_id,
     });
 
     spawn_workers(
@@ -433,6 +482,7 @@ async fn build_connection(
         num_cpus,
         first_payload,
         fec_config.clone(),
+        fec_ttl,
     );
 
     spawn_idle_timeout(
@@ -472,6 +522,7 @@ fn spawn_workers(
     num_cpus: usize,
     first_payload: Option<Vec<u8>>,
     fec_config: Option<FecConfig>,
+    fec_ttl: time::Duration,
 ) {
     for i in 0..num_cpus {
         let sock = entry.socket.clone();
@@ -479,6 +530,7 @@ fn spawn_workers(
         let packet_received = entry.packet_received.clone();
         let udp_local_addr = entry.udp_local_addr;
         let fec_config = fec_config.clone();
+        let fec_ttl = fec_ttl;
         let initial_payload = if i == 0 { first_payload.clone() } else { None };
 
         tokio::spawn(async move {
@@ -515,9 +567,7 @@ fn spawn_workers(
             let mut encoder = fec_config
                 .as_ref()
                 .map(|cfg| FecEncoder::new(cfg.clone(), MAX_PACKET_LEN));
-            let mut decoder = fec_config
-                .as_ref()
-                .map(|cfg| FecDecoder::new(cfg.group_ttl, MAX_FEC_GROUPS));
+            let mut decoder = FecDecoder::new(fec_ttl, MAX_FEC_GROUPS);
             let mut flush_interval = fec_config.as_ref().map(|cfg| {
                 let mut interval = time::interval(cfg.flush_interval);
                 interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -563,14 +613,12 @@ fn spawn_workers(
                             match res {
                                 Some(size) => {
                                     if size > 0 {
-                                        if let Some(ref mut decoder) = decoder {
-                                            let packets = decoder.push(&buf_tcp[..size]);
-                                            for packet in packets {
-                                                if let Err(e) = udp_sock.send(&packet).await {
-                                                    error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
-                                                    quit.cancel();
-                                                    return;
-                                                }
+                                        let packets = decoder.push(&buf_tcp[..size]);
+                                        for packet in packets {
+                                            if let Err(e) = udp_sock.send(&packet).await {
+                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                quit.cancel();
+                                                return;
                                             }
                                         }
                                     }
@@ -615,12 +663,16 @@ fn spawn_workers(
                         res = sock.recv(&mut buf_tcp) => {
                             match res {
                                 Some(size) => {
-                                    if size > 0
-                                        && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
-                                            error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
-                                            quit.cancel();
-                                            return;
+                                    if size > 0 {
+                                        let packets = decoder.push(&buf_tcp[..size]);
+                                        for packet in packets {
+                                            if let Err(e) = udp_sock.send(&packet).await {
+                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                quit.cancel();
+                                                return;
+                                            }
                                         }
+                                    }
                                 },
                                 None => {
                                     debug!("removed fake TCP socket from connections table");

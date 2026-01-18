@@ -88,6 +88,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayvec"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -149,6 +155,12 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
+name = "circular"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0fc239e0f6cb375d2402d48afb92f76f5404fd1df208a41930ec81eda078bea"
 
 [[package]]
 name = "clap"
@@ -269,15 +281,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "etherparse"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b119b9796ff800751a220394b8b3613f26dd30c48f254f6837e64c464872d1c7"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
 name = "fake-tcp"
 version = "0.7.1"
 dependencies = [
  "bytes",
+ "etherparse",
  "flume",
  "internet-checksum",
  "log",
+ "pcap-parser",
  "pnet",
  "rand",
+ "reed-solomon-erasure",
  "tokio",
  "tokio-tun",
 ]
@@ -580,6 +604,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43794a0ace135be66a25d3ae77d41b91615fb68ae937f904090203e81f755b65"
 
 [[package]]
+name = "nom"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "num_cpus"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -656,6 +689,17 @@ dependencies = [
  "redox_syscall 0.5.17",
  "smallvec",
  "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "pcap-parser"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1099a3a64b376c536394622c9e5ea8ecfac3e3e44f88857b1e7da114135d3df4"
+dependencies = [
+ "circular",
+ "nom",
+ "rusticata-macros",
 ]
 
 [[package]]
@@ -932,6 +976,15 @@ name = "rustc-demangle"
 version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56f7d92ca342cea22a06f2121d944b4fd82af56988c270852495420f961d4ace"
+
+[[package]]
+name = "rusticata-macros"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f40620447734539bcc6c64e9c66fed2410e17b46986733f1090c922d85f7105b"
+dependencies = [
+ "nom",
+]
 
 [[package]]
 name = "scopeguard"

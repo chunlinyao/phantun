@@ -243,6 +243,21 @@ Or use host name with `--remote`:
 RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote example.com:4567
 ```
 
+Rotation note: the client can rotate fake TCP source ports with `--rotate-interval`. When both
+ends are updated, rotations reuse the same upstream UDP source port to preserve server-side
+session state. You can tune the handover windows with `--rotate-grace-ms` on the client and
+server.
+
+### Forward Error Correction (FEC)
+
+`--fec` controls whether the sender encodes UDP packets with FEC. The receiver automatically
+detects and decodes FEC frames when present, so FEC can be enabled on a single direction or
+with different parameters on each side.
+
+`--fec-ttl-ms` controls the decoder cache window. Completed FEC groups are deduplicated for
+`2 x --fec-ttl-ms` to avoid late or duplicate shard replays. For long-RTT or high-jitter links,
+increase `--fec-ttl-ms` accordingly.
+
 <details>
   <summary>IPv6 specific config</summary>
 

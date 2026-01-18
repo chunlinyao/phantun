@@ -23,3 +23,8 @@ tokio-tun = "0"
 flume = "0"
 tokio = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+etherparse = "0.19.0"
+pcap-parser = "0.17.0"
+reed-solomon-erasure = "6.0.0"
