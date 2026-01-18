@@ -248,9 +248,8 @@ impl FecDecoder {
             }
         }
 
-        let completed_ttl = self.ttl.saturating_mul(2);
-        self.completed
-            .retain(|_, ts| now.duration_since(*ts) <= completed_ttl);
+        // Keep completed group IDs around (bounded by max_groups) to suppress late duplicates,
+        // even if they arrive well after the group TTL.
         if !self.completed_order.is_empty() {
             let mut filtered = VecDeque::with_capacity(self.completed_order.len());
             for id in self.completed_order.drain(..) {
