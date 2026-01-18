@@ -43,6 +43,7 @@ pub struct FecEncoder {
     config: FecConfig,
     max_packet_len: usize,
     group_id: u64,
+    group_id_step: u64,
     pending: Vec<Vec<u8>>,
 }
 
@@ -52,6 +53,22 @@ impl FecEncoder {
             config,
             max_packet_len,
             group_id: 0,
+            group_id_step: 1,
+            pending: Vec::new(),
+        }
+    }
+
+    pub fn new_with_stride(
+        config: FecConfig,
+        max_packet_len: usize,
+        group_id_start: u64,
+        group_id_step: u64,
+    ) -> Self {
+        Self {
+            config,
+            max_packet_len,
+            group_id: group_id_start,
+            group_id_step: group_id_step.max(1),
             pending: Vec::new(),
         }
     }
@@ -129,7 +146,7 @@ impl FecEncoder {
         }
 
         let group_id = self.group_id;
-        self.group_id = self.group_id.wrapping_add(1);
+        self.group_id = self.group_id.wrapping_add(self.group_id_step);
 
         shards
             .into_iter()
@@ -480,6 +497,40 @@ mod tests {
         let mut expected_sorted = payloads.clone();
         expected_sorted.sort();
         assert_eq!(recovered_sorted, expected_sorted);
+    }
+
+    #[test]
+    fn fec_encoder_group_id_stride_avoids_collisions() {
+        let config = FecConfig {
+            data_shards: 2,
+            parity_shards: 1,
+            flush_interval: Duration::from_millis(5),
+            group_ttl: Duration::from_millis(200),
+        };
+        let mut encoder_a = FecEncoder::new_with_stride(config.clone(), 1500, 0, 2);
+        let mut encoder_b = FecEncoder::new_with_stride(config.clone(), 1500, 1, 2);
+
+        let mut frames_a = Vec::new();
+        let mut frames_b = Vec::new();
+        for payload in [b"alpha", b"bravo"] {
+            frames_a.extend(encoder_a.push(payload));
+            frames_b.extend(encoder_b.push(payload));
+        }
+
+        let mut ids_a = Vec::new();
+        for frame in &frames_a {
+            let parsed = decode_frame(frame).expect("decode frame A");
+            ids_a.push(parsed.group_id);
+        }
+        let mut ids_b = Vec::new();
+        for frame in &frames_b {
+            let parsed = decode_frame(frame).expect("decode frame B");
+            ids_b.push(parsed.group_id);
+        }
+
+        for id in ids_a {
+            assert!(!ids_b.contains(&id));
+        }
     }
 
     #[test]

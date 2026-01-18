@@ -23,3 +23,7 @@ nix = { version = "0", features = ["net", "uio", "socket"] }
 tokio = { workspace = true }
 log = { workspace = true }
 reed-solomon-erasure = "6"
+
+[dev-dependencies]
+etherparse = "0.19.0"
+pcap-parser = "0.17.0"

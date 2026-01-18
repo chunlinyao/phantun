@@ -564,9 +564,14 @@ fn spawn_workers(
             let udp_sock = new_udp_reuseport(bind_addr);
             udp_sock.connect(udp_remote_addr).await.unwrap();
 
-            let mut encoder = fec_config
-                .as_ref()
-                .map(|cfg| FecEncoder::new(cfg.clone(), MAX_PACKET_LEN));
+            let mut encoder = fec_config.as_ref().map(|cfg| {
+                FecEncoder::new_with_stride(
+                    cfg.clone(),
+                    MAX_PACKET_LEN,
+                    i as u64,
+                    num_cpus as u64,
+                )
+            });
             let mut decoder = FecDecoder::new(fec_ttl, MAX_FEC_GROUPS);
             let mut flush_interval = fec_config.as_ref().map(|cfg| {
                 let mut interval = time::interval(cfg.flush_interval);

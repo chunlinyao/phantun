@@ -707,11 +707,13 @@ name = "phantun"
 version = "0.8.1"
 dependencies = [
  "clap",
+ "etherparse",
  "fake-tcp",
  "log",
  "neli",
  "nix",
  "num_cpus",
+ "pcap-parser",
  "pretty_env_logger",
  "reed-solomon-erasure",
  "socket2",

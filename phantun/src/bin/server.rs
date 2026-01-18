@@ -402,9 +402,14 @@ fn spawn_workers(
             let mut buf_udp = [0u8; MAX_PACKET_LEN];
             let mut buf_tcp = [0u8; MAX_PACKET_LEN];
             udp_sock.connect(remote_addr).await.unwrap();
-            let mut encoder = fec_config
-                .as_ref()
-                .map(|cfg| FecEncoder::new(cfg.clone(), MAX_PACKET_LEN));
+            let mut encoder = fec_config.as_ref().map(|cfg| {
+                FecEncoder::new_with_stride(
+                    cfg.clone(),
+                    MAX_PACKET_LEN,
+                    i as u64,
+                    num_cpus as u64,
+                )
+            });
             let mut decoder = FecDecoder::new(fec_ttl, MAX_FEC_GROUPS);
             let mut flush_interval = fec_config.as_ref().map(|cfg| {
                 let mut interval = time::interval(cfg.flush_interval);
