@@ -1,13 +1,14 @@
 use etherparse::{SlicedPacket, TransportSlice};
 use pcap_parser::traits::PcapReaderIterator;
 use pcap_parser::{LegacyPcapReader, Linktype, PcapBlockOwned, PcapError};
-use phantun::fec::FecDecoder;
+use phantun::fec::{peek_frame_len, FecDecoder, FrameParse};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
 const FEC_MAGIC: [u8; 4] = *b"FEC1";
+const LEGACY_HEADER_BASE_LEN: usize = 4 + 1 + 1 + 1 + 1 + 8 + 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FlowKey {
@@ -44,6 +45,24 @@ fn split_frames(payload: &[u8]) -> Vec<&[u8]> {
         }
     }
     frames
+}
+
+fn convert_legacy_frame(frame: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < LEGACY_HEADER_BASE_LEN {
+        return None;
+    }
+    let lengths_count = *frame.get(16)? as usize;
+    let lengths_bytes = lengths_count.checked_mul(2)?;
+    let header_len = LEGACY_HEADER_BASE_LEN + lengths_bytes;
+    if frame.len() < header_len {
+        return None;
+    }
+    let payload_len = frame.len().checked_sub(header_len)? as u32;
+    let mut buf = Vec::with_capacity(frame.len() + 4);
+    buf.extend_from_slice(&frame[..17]);
+    buf.extend_from_slice(&payload_len.to_be_bytes());
+    buf.extend_from_slice(&frame[17..]);
+    Some(buf)
 }
 
 fn extract_fec_payloads(data: &[u8], linktype: Linktype) -> Option<FlowPayload> {
@@ -150,7 +169,14 @@ fn decode_flow(packets: &[FlowPayload]) -> Vec<u8> {
     let mut out = Vec::new();
     for packet in packets {
         for frame in split_frames(&packet.payload) {
-            for data in decoder.push(frame) {
+            let frame = match peek_frame_len(frame) {
+                FrameParse::Complete(_) => frame.to_vec(),
+                _ => match convert_legacy_frame(frame) {
+                    Some(converted) => converted,
+                    None => frame.to_vec(),
+                },
+            };
+            for data in decoder.push(&frame) {
                 out.extend_from_slice(&data);
             }
         }

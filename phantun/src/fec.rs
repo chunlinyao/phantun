@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 const FEC_MAGIC: u32 = 0x46454331; // "FEC1"
 const FEC_VERSION: u8 = 1;
-const HEADER_BASE_LEN: usize = 4 + 1 + 1 + 1 + 1 + 8 + 1;
+const HEADER_BASE_LEN: usize = 4 + 1 + 1 + 1 + 1 + 8 + 1 + 4;
 const MAX_DATA_SHARDS: usize = 32;
 
 #[derive(Clone, Debug)]
@@ -171,6 +171,59 @@ pub struct FecDecoder {
     groups: HashMap<u64, GroupState>,
     completed: HashMap<u64, Instant>,
     completed_order: VecDeque<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum FrameParse {
+    Incomplete,
+    Invalid,
+    Complete(usize),
+}
+
+pub fn peek_frame_len(frame: &[u8]) -> FrameParse {
+    if frame.len() < HEADER_BASE_LEN {
+        return FrameParse::Incomplete;
+    }
+    let magic = match frame[0..4].try_into() {
+        Ok(bytes) => u32::from_be_bytes(bytes),
+        Err(_) => return FrameParse::Invalid,
+    };
+    if magic != FEC_MAGIC || frame[4] != FEC_VERSION {
+        return FrameParse::Invalid;
+    }
+    let data_shards = frame[5];
+    let parity_shards = frame[6];
+    let shard_index = frame[7];
+    let lengths_count = frame[16] as usize;
+    let payload_len = match frame[17..21].try_into() {
+        Ok(bytes) => u32::from_be_bytes(bytes) as usize,
+        Err(_) => return FrameParse::Invalid,
+    };
+    let data_shards_usize = data_shards as usize;
+    let parity_shards_usize = parity_shards as usize;
+    let total_shards = data_shards_usize + parity_shards_usize;
+    if data_shards == 0
+        || parity_shards == 0
+        || data_shards_usize > MAX_DATA_SHARDS
+        || parity_shards_usize > MAX_DATA_SHARDS
+        || shard_index as usize >= total_shards
+        || lengths_count != data_shards_usize
+    {
+        return FrameParse::Invalid;
+    }
+    let lengths_bytes = match lengths_count.checked_mul(2) {
+        Some(bytes) => bytes,
+        None => return FrameParse::Invalid,
+    };
+    let header_len = HEADER_BASE_LEN + lengths_bytes;
+    let total_len = match header_len.checked_add(payload_len) {
+        Some(total) => total,
+        None => return FrameParse::Invalid,
+    };
+    if frame.len() < total_len {
+        return FrameParse::Incomplete;
+    }
+    FrameParse::Complete(total_len)
 }
 
 impl FecDecoder {
@@ -384,6 +437,7 @@ fn encode_frame(
     buf.push(shard_index);
     buf.extend_from_slice(&group_id.to_be_bytes());
     buf.push(lengths.len() as u8);
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     for len in lengths {
         buf.extend_from_slice(&len.to_be_bytes());
     }
@@ -407,6 +461,7 @@ fn decode_frame(frame: &[u8]) -> Option<ParsedFrame> {
     let shard_index = frame[7];
     let group_id = u64::from_be_bytes(frame[8..16].try_into().ok()?);
     let lengths_count = frame[16] as usize;
+    let payload_len = u32::from_be_bytes(frame[17..21].try_into().ok()?) as usize;
     let data_shards_usize = data_shards as usize;
     let parity_shards_usize = parity_shards as usize;
     let total_shards = data_shards_usize + parity_shards_usize;
@@ -421,7 +476,8 @@ fn decode_frame(frame: &[u8]) -> Option<ParsedFrame> {
     }
     let lengths_bytes = lengths_count.checked_mul(2)?;
     let header_len = HEADER_BASE_LEN + lengths_bytes;
-    if frame.len() < header_len {
+    let total_len = header_len.checked_add(payload_len)?;
+    if frame.len() < total_len {
         return None;
     }
     let mut lengths = Vec::with_capacity(lengths_count);
@@ -429,7 +485,7 @@ fn decode_frame(frame: &[u8]) -> Option<ParsedFrame> {
         let start = HEADER_BASE_LEN + i * 2;
         lengths.push(u16::from_be_bytes(frame[start..start + 2].try_into().ok()?));
     }
-    let payload = frame[header_len..].to_vec();
+    let payload = frame[header_len..header_len + payload_len].to_vec();
     Some(ParsedFrame {
         group_id,
         data_shards,
@@ -622,5 +678,31 @@ mod tests {
 
         let dup = decoder.push(&frames[0]);
         assert!(dup.is_empty());
+    }
+
+    #[test]
+    fn peek_frame_len_handles_complete_and_incomplete() {
+        let lengths = vec![5u16, 0u16];
+        let payload = b"hello";
+        let frame = encode_frame(42, 2, 1, 0, &lengths, payload);
+
+        assert_eq!(peek_frame_len(&frame), FrameParse::Complete(frame.len()));
+        assert_eq!(
+            peek_frame_len(&frame[..frame.len() - 1]),
+            FrameParse::Incomplete
+        );
+    }
+
+    #[test]
+    fn decode_frame_respects_payload_length() {
+        let lengths = vec![5u16];
+        let payload = b"hello";
+        let frame = encode_frame(7, 1, 1, 0, &lengths, payload);
+        let mut extended = frame.clone();
+        extended.extend_from_slice(b"trailing");
+
+        let parsed = decode_frame(&extended).expect("decode frame");
+        assert_eq!(parsed.payload, payload);
+        assert_eq!(parsed.lengths, lengths);
     }
 }

@@ -2,7 +2,7 @@ use clap::{Arg, ArgAction, Command, crate_version, value_parser};
 use fake_tcp::{Socket, Stack};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use log::{debug, error, info};
-use phantun::fec::{FecConfig, FecDecoder, FecEncoder, parse_fec_spec};
+use phantun::fec::{parse_fec_spec, peek_frame_len, FecConfig, FecDecoder, FecEncoder, FrameParse};
 use phantun::proto::{parse_control_frame, ControlType};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
 use std::collections::HashMap;
@@ -411,6 +411,7 @@ fn spawn_workers(
                 )
             });
             let mut decoder = FecDecoder::new(fec_ttl, MAX_FEC_GROUPS);
+            let mut recv_buffer = Vec::new();
             let mut flush_interval = fec_config.as_ref().map(|cfg| {
                 let mut interval = time::interval(cfg.flush_interval);
                 interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -455,12 +456,36 @@ fn spawn_workers(
                             match res {
                                 Some(size) => {
                                     if size > 0 {
-                                        let packets = decoder.push(&buf_tcp[..size]);
-                                        for packet in packets {
-                                            if let Err(e) = udp_sock.send(&packet).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
-                                                quit.cancel();
-                                                return;
+                                        recv_buffer.extend_from_slice(&buf_tcp[..size]);
+                                        loop {
+                                            if recv_buffer.is_empty() {
+                                                break;
+                                            }
+                                            match peek_frame_len(&recv_buffer) {
+                                                FrameParse::Complete(frame_len) => {
+                                                    let frame: Vec<u8> =
+                                                        recv_buffer.drain(..frame_len).collect();
+                                                    let packets = decoder.push(&frame);
+                                                    for packet in packets {
+                                                        if let Err(e) = udp_sock.send(&packet).await {
+                                                            error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                            quit.cancel();
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                FrameParse::Incomplete => break,
+                                                FrameParse::Invalid => {
+                                                    let frame = std::mem::take(&mut recv_buffer);
+                                                    let packets = decoder.push(&frame);
+                                                    for packet in packets {
+                                                        if let Err(e) = udp_sock.send(&packet).await {
+                                                            error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                            quit.cancel();
+                                                            return;
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -505,12 +530,36 @@ fn spawn_workers(
                             match res {
                                 Some(size) => {
                                     if size > 0 {
-                                        let packets = decoder.push(&buf_tcp[..size]);
-                                        for packet in packets {
-                                            if let Err(e) = udp_sock.send(&packet).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
-                                                quit.cancel();
-                                                return;
+                                        recv_buffer.extend_from_slice(&buf_tcp[..size]);
+                                        loop {
+                                            if recv_buffer.is_empty() {
+                                                break;
+                                            }
+                                            match peek_frame_len(&recv_buffer) {
+                                                FrameParse::Complete(frame_len) => {
+                                                    let frame: Vec<u8> =
+                                                        recv_buffer.drain(..frame_len).collect();
+                                                    let packets = decoder.push(&frame);
+                                                    for packet in packets {
+                                                        if let Err(e) = udp_sock.send(&packet).await {
+                                                            error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                            quit.cancel();
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                FrameParse::Incomplete => break,
+                                                FrameParse::Invalid => {
+                                                    let frame = std::mem::take(&mut recv_buffer);
+                                                    let packets = decoder.push(&frame);
+                                                    for packet in packets {
+                                                        if let Err(e) = udp_sock.send(&packet).await {
+                                                            error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                            quit.cancel();
+                                                            return;
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
